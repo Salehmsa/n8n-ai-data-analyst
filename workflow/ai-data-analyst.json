@@ -1,0 +1,456 @@
+{
+  "name": "AI Data Analyst",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.5,
+      "position": [
+        0,
+        256
+      ],
+      "id": "b0e97048-8979-4fe0-9350-7ce5c38e6ff0",
+      "name": "When chat message received",
+      "webhookId": "784b3c92-b74a-4709-b598-93fd2d1bc847"
+    },
+    {
+      "parameters": {
+        "fileSelector": "/home/node/.n8n-files/Sales_Data.csv",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        224,
+        256
+      ],
+      "id": "72c26471-4012-4b3f-b09a-df1a9ddbc9cd",
+      "name": "Read/Write Files from Disk"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        448,
+        256
+      ],
+      "id": "3455470d-4ef2-4083-8f7c-d3bb3a99269f",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Clean Data — flag, don't drop\nconst REGIONS = ['Riyadh', 'Jeddah', 'Dammam'];\nconst HARD_FAIL = ['bad_date', 'missing_units', 'invalid_units',\n                   'missing_revenue', 'invalid_revenue', 'price_outlier'];\n\nconst toNum = (v) => {\n  const s = String(v ?? '').trim().replace(/,/g, '');\n  if (s === '' || /^(n\\/a|na|null|nan|-)$/i.test(s)) return null;\n  const n = Number(s);\n  return Number.isFinite(n) ? n : null;\n};\n\nconst toISODate = (v) => {\n  const s = String(v ?? '').trim();\n  let iso = null, m;\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) iso = s;\n  else if ((m = s.match(/^(\\d{2})\\/(\\d{2})\\/(\\d{4})$/))) iso = `${m[3]}-${m[2]}-${m[1]}`;\n  if (!iso) return null;\n  const d = new Date(iso + 'T00:00:00Z');\n  return !isNaN(d) && d.toISOString().slice(0, 10) === iso ? iso : null;\n};\n\nconst median = (arr) => {\n  const s = [...arr].sort((a, b) => a - b);\n  const mid = Math.floor(s.length / 2);\n  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;\n};\n\n// 1) Normalize types, standardize text, flag problems, drop exact duplicates\nconst seen = new Set();\nconst rows = [];\nfor (const { json: r } of $input.all()) {\n  const flags = [];\n\n  const date = toISODate(r.Date);\n  if (!date) flags.push('bad_date');\n\n  const regionKey = String(r.Region ?? '').trim().toLowerCase();\n  const region = REGIONS.find((x) => x.toLowerCase() === regionKey) ?? 'Unknown';\n  if (region === 'Unknown') flags.push('missing_region');\n\n  const product = String(r.Product ?? '').trim() || 'Unknown';\n  if (product === 'Unknown') flags.push('missing_product');\n\n  let units = toNum(r.Units);\n  if (units === null) flags.push('missing_units');\n  else if (units <= 0) { units = null; flags.push('invalid_units'); }\n\n  let revenue = toNum(r.Revenue);\n  if (revenue === null) flags.push('missing_revenue');\n  else if (revenue <= 0) { revenue = null; flags.push('invalid_revenue'); }\n\n  const cost = toNum(r.Cost);\n  if (cost === null) flags.push('missing_cost');\n\n  const row = {\n    date, month: date ? date.slice(0, 7) : null,\n    region, product, category: String(r.Category ?? '').trim(),\n    units, revenue, cost,\n    profit: revenue !== null && cost !== null ? revenue - cost : null,\n    flags,\n  };\n\n  const key = [date, region, product, row.category, units, revenue, cost].join('|');\n  if (seen.has(key)) continue;\n  seen.add(key);\n  rows.push(row);\n}\n\n// 2) Price-consistency check against each product's median unit price\nconst prices = {};\nfor (const r of rows) {\n  if (r.units && r.revenue && r.product !== 'Unknown') {\n    (prices[r.product] ??= []).push(r.revenue / r.units);\n  }\n}\nconst medians = Object.fromEntries(\n  Object.entries(prices).map(([p, a]) => [p, median(a)])\n);\n\nfor (const r of rows) {\n  const m = medians[r.product];\n  if (m && r.units && r.revenue) {\n    const ratio = r.revenue / r.units / m;\n    if (ratio > 3 || ratio < 1 / 3) r.flags.push('price_outlier');\n  }\n  r.is_valid = !r.flags.some((f) => HARD_FAIL.includes(f));\n}\n\nreturn rows.map((r) => ({ json: r }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        256
+      ],
+      "id": "c325dc8e-1a1e-4d7f-bfd0-357b80f028cb",
+      "name": "Clean Data"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Summarize — KPIs + data-quality report (single output item)\nconst all = $input.all().map((i) => i.json);\nconst valid = all.filter((r) => r.is_valid);\nconst rawCount = $('Extract from File').all().length;\n\nconst sum = (a, k) => a.reduce((s, r) => s + (r[k] ?? 0), 0);\nconst round = (n, d = 0) => Math.round(n * 10 ** d) / 10 ** d;\n\n// Margin uses only rows where cost is known, so missing costs don't distort it\nconst agg = (rows) => {\n  const withCost = rows.filter((r) => r.profit !== null);\n  const revenue = sum(rows, 'revenue');\n  const profit = sum(withCost, 'profit');\n  const revWithCost = sum(withCost, 'revenue');\n  return {\n    orders: rows.length,\n    units: sum(rows, 'units'),\n    revenue: round(revenue),\n    profit: round(profit),\n    margin_pct: revWithCost ? round((profit / revWithCost) * 100, 1) : null,\n    avg_order_value: rows.length ? round(revenue / rows.length) : null,\n  };\n};\n\nconst groupBy = (rows, key) => {\n  const g = {};\n  for (const r of rows) (g[r[key]] ??= []).push(r);\n  return Object.entries(g)\n    .map(([name, rs]) => ({ name, ...agg(rs) }))\n    .sort((a, b) => b.revenue - a.revenue);\n};\n\nconst byMonth = groupBy(valid.filter((r) => r.month), 'month')\n  .sort((a, b) => a.name.localeCompare(b.name));\nbyMonth.forEach((m, i) => {\n  const prev = byMonth[i - 1];\n  m.mom_growth_pct = prev && prev.revenue\n    ? round(((m.revenue - prev.revenue) / prev.revenue) * 100, 1)\n    : null;\n});\n\nconst flagCounts = {};\nfor (const r of all) for (const f of r.flags) flagCounts[f] = (flagCounts[f] ?? 0) + 1;\n\nconst dates = valid.map((r) => r.date).filter(Boolean).sort();\n\nconst summary = {\n  period: { from: dates[0], to: dates[dates.length - 1] },\n  data_quality: {\n    raw_rows: rawCount,\n    duplicates_removed: rawCount - all.length,\n    rows_after_dedup: all.length,\n    valid_rows: valid.length,\n    excluded_rows: all.length - valid.length,\n    issues_by_type: flagCounts,\n  },\n  overall: agg(valid),\n  by_region: groupBy(valid, 'region'),\n  by_category: groupBy(valid, 'category'),\n  by_product: groupBy(valid, 'product'),\n  by_month: byMonth,\n};\n\nreturn [{ json: { summary } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        256
+      ],
+      "id": "8ff65818-3ba2-4d65-b55c-01e8239da3ad",
+      "name": "Summarize"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Question: {{ $('When chat message received').first().json.chatInput }}",
+        "options": {
+          "systemMessage": "=You are a senior data analyst and business consultant. You receive a user question plus a pre-computed JSON summary of a sales dataset (orders, units, revenue, profit, margin by region, category, product and month, plus a data-quality report).\n\nRules:\n1. Use ONLY the numbers in the JSON. Never invent figures or recompute totals. You may derive simple shares or ratios from the given numbers, and say so.\n2. Answer the question first in 1-2 sentences, then support it with specific figures, then give 2-3 actionable business recommendations.\n3. If data quality could affect a conclusion (excluded rows, 'Unknown' groups), mention it in one short line.\n4. If the summary cannot answer the question, say exactly what extra data would be needed. Do not guess causes.\n5. The currency is not specified in the data. Do not assume one.\n6. Reply in the same language as the question (Arabic or English). Use short headings and bullets, thousands separators, and 1 decimal for percentages.\n\nDATA SUMMARY (JSON):\n{{ JSON.stringify($('Summarize').first().json.summary) }}"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1344,
+        0
+      ],
+      "id": "f090a56e-4e64-4473-a540-ff1e695cbefa",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "claude-sonnet-5-5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        1360,
+        240
+      ],
+      "id": "f8cf3dc2-189d-4087-8e13-ed77482c74ec",
+      "name": "Anthropic Chat Model",
+      "credentials": {
+        "anthropicApi": {
+          "id": "UYGsNUyymC4OYG5A",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('When chat message received').first().json.sessionId }}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.4,
+      "position": [
+        1488,
+        240
+      ],
+      "id": "48e5f16c-2c81-42e1-917e-9bed80a1647f",
+      "name": "Simple Memory"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "3b3e524d-a77d-4a94-af52-68ed01075e54",
+              "leftValue": "={{ !/report|تقرير/i.test($('When chat message received').first().json.chatInput) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        256
+      ],
+      "id": "3a01bb19-251f-4498-8b29-ca7bb5249400",
+      "name": "Q&A or Report"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "claude-sonnet-5-5",
+          "mode": "list",
+          "cachedResultName": "claude-sonnet-5-5"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=Here is the sales data summary (trusted, pre-computed):\n{{ JSON.stringify($('Summarize').first().json.summary) }}"
+            }
+          ]
+        },
+        "options": {
+          "system": "You are a senior business analyst writing an executive report for a leadership team. You receive a JSON summary of sales data (pre-computed and trusted).  Return ONLY a valid JSON object (no markdown, no code fences, no commentary) with exactly this schema: {   \"title\": string,   \"headline\": string,   \"key_findings\": [ { \"title\": string, \"detail\": string } ],   \"risks\": [ { \"title\": string, \"detail\": string } ],   \"recommendations\": [ { \"priority\": \"high\" | \"medium\" | \"low\", \"action\": string, \"rationale\": string } ],   \"chart_captions\": { \"monthly\": string, \"region\": string, \"category\": string },   \"data_quality_note\": string }  Counts: headline = 2 sentences; key_findings = 4 to 5; risks = 2 to 3; recommendations = 3 to 5; chart_captions = one sentence each; data_quality_note = 1 to 2 sentences.  Rules: 1. Write all text values in Modern Standard Arabic. Keep product and region names exactly as in the data (English). Use Western digits (0-9). 2. Use ONLY numbers present in the JSON. You may derive shares and differences. Never invent causes, targets or external facts; if a cause is not in the data, say it needs further investigation. 3. Quote concrete figures with thousands separators and percentages with 1 decimal. 4. Do not assume a currency. 5. Every recommendation must follow from a specific finding.\n\nACCURACY RULES:\n- Never use vague fractions or words such as \"ثلث\", \"نصف\", \"ربع\", \"تقريبًا\" for shares. Use the exact percentage.\n- A percentage in a title must match the percentage in its detail text. If a share is not in the JSON and not a simple sum of values that are, do not state it.\n- Do not introduce any number that is not in the JSON or a direct sum/ratio of numbers in it.\n- data_quality_note must NOT restate row counts (raw, duplicates, excluded, valid). Those are shown separately. Cover only which issue types were most common and how they affect the reliability of region/product figures.\n\nQUALITY RULES:\n- Refer to months by their Arabic name with the year (e.g. \"سبتمبر 2026\"), never in ISO form like 2026-09.\n- data_quality_note must also state that margin percentages are computed only on records with a known cost, so they may differ slightly from total profit ÷ total revenue.\n- Do not call a difference \"lowest\" or recommend investigating it when the gap is under 2 percentage points; say instead that the figures are close.\n- The first key finding must give an insight that is NOT already visible in the KPI cards (not a restatement of total revenue, profit, orders or margin).",
+          "maxTokens": 8000
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [
+        1344,
+        400
+      ],
+      "id": "570de11f-71f1-46a1-ae38-f81ebcfa1305",
+      "name": "Write Report",
+      "credentials": {
+        "anthropicApi": {
+          "id": "UYGsNUyymC4OYG5A",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build HTML — executive report (self-contained, RTL, inline SVG, no external dependencies)\nconst S = $('Summarize').first().json.summary;\n\n// 1) Read and parse Claude's JSON (tolerant of code fences / extra text)\nconst raw = $input.first().json;\nconst blocks = Array.isArray(raw.content) ? raw.content : [];\nlet text = blocks.filter((blk) => blk.type === 'text').map((blk) => blk.text).join('\\n');\nif (!text) text = String(raw.text ?? raw.output ?? '');\n\nlet R;\ntry {\n  const cleaned = text.replace(/```json|```/gi, '').trim();\n  const start = cleaned.indexOf('{');\n  const end = cleaned.lastIndexOf('}');\n  if (start === -1 || end === -1) throw new Error('no JSON object found');\n  R = JSON.parse(cleaned.slice(start, end + 1));\n} catch (e) {\n  throw new Error(`Could not parse the report JSON (${e.message}). If the text looks cut off, raise Maximum Number of Tokens in Write Report. Start of output: ${text.slice(0, 200)}`);\n}\nconst arr = (v) => (Array.isArray(v) ? v : []);\nconst cap = R.chart_captions ?? {};\n\n// 2) Helpers\nconst esc = (s) => String(s ?? '').replace(/[&<>\"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[c]));\nconst fmt = (n) => Number(n ?? 0).toLocaleString('en-US');\nconst M = (n) => (Number(n) / 1e6).toFixed(2) + 'M';\nconst AR_MONTHS = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];\nconst monthLabel = (ym) => AR_MONTHS[Number(ym.slice(5, 7)) - 1] ?? ym;\nconst label = (n) => (n === 'Unknown' ? 'غير محدد' : n);\nconst o = S.overall;\nconst dq = S.data_quality;\n\nconst columnChart = (items) => {\n  const W = 720, H = 310, padT = 28, padB = 56, padX = 16;\n  const max = Math.max(...items.map((d) => d.revenue), 1);\n  const slot = (W - padX * 2) / items.length;\n  const best = items.reduce((m, d) => (d.revenue > m.revenue ? d : m), items[0]);\n  const bars = items.map((d, i) => {\n    const h = ((H - padT - padB) * d.revenue) / max;\n    const w = slot * 0.66;\n    const x = padX + i * slot + slot * 0.17;\n    const cx = x + w / 2;\n    const y = H - padB - h;\n    const g = d.mom_growth_pct;\n    const growth = g === null || g === undefined ? '' :\n      `<text x=\"${cx}\" y=\"${H - 6}\" text-anchor=\"middle\" class=\"gr ${g >= 0 ? 'up' : 'down'}\">${g > 0 ? '+' : ''}${Number(g).toFixed(1)}%</text>`;\n    const fill = d.name === best.name ? 'var(--hi)' : 'var(--accent)';\n    return `<rect x=\"${x}\" y=\"${y}\" width=\"${w}\" height=\"${h}\" rx=\"4\" style=\"fill:${fill}\"/>\n<text x=\"${cx}\" y=\"${y - 8}\" text-anchor=\"middle\" class=\"val\">${M(d.revenue)}</text>\n<text x=\"${cx}\" y=\"${H - 26}\" text-anchor=\"middle\" class=\"lbl\">${monthLabel(d.name)}</text>${growth}`;\n  }).join('');\n  return `<svg viewBox=\"0 0 ${W} ${H}\" role=\"img\" aria-label=\"الإيراد الشهري\">${bars}</svg>`;\n};\n\nconst hBars = (items, subFn) => {\n  const max = Math.max(...items.map((d) => d.revenue), 1);\n  return items.map((d) => `<div class=\"hrow\"><div>${esc(label(d.name))}</div><div class=\"htrack\"><div class=\"hfill\" style=\"width:${((d.revenue / max) * 100).toFixed(1)}%\"></div></div><div class=\"hval\">${M(d.revenue)} <span class=\"sub\">${esc(subFn(d))}</span></div></div>`).join('');\n};\nconst share = (d) => `${((d.revenue / o.revenue) * 100).toFixed(1)}%`;\nconst margin = (d) => `هامش ${Number(d.margin_pct).toFixed(1)}%`;\n\n// 3) Content blocks\nconst kpis = [\n  ['إجمالي الإيراد', fmt(o.revenue)],\n  ['إجمالي الربح', fmt(o.profit)],\n  ['هامش الربح', `${o.margin_pct}%`],\n  ['عدد الطلبات', fmt(o.orders)],\n  ['متوسط قيمة الطلب', fmt(o.avg_order_value)],\n];\nconst prio = { high: ['أولوية عالية', 'p-high'], medium: ['أولوية متوسطة', 'p-med'], low: ['أولوية منخفضة', 'p-low'] };\nconst topProducts = S.by_product.filter((p) => p.name !== 'Unknown').slice(0, 5);\nconst today = new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Riyadh' });\nconst isoDay = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Riyadh' });\n\nconst html = `<!doctype html>\n<html lang=\"ar\" dir=\"rtl\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>${esc(R.title)}</title>\n<style>\n:root{--bg:#F4F6F9;--card:#fff;--ink:#1B2733;--muted:#5B6B7A;--line:#E3E8EE;--accent:#1F5F99;--hi:#C85F0A;--up:#1B7F4B;--down:#B3261E}\n*{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact}\nbody{margin:0;background:var(--bg);color:var(--ink);font-family:'Segoe UI',Tahoma,Arial,sans-serif;line-height:1.7}\n.wrap{max-width:980px;margin:0 auto;padding:28px 18px 48px}\nheader{background:linear-gradient(135deg,#0F2E4A,#1F5F99);color:#fff;border-radius:16px;padding:28px}\nheader h1{margin:0 0 6px;font-size:26px}\nheader .meta{opacity:.85;font-size:14px}\n.headline{margin-top:16px;font-size:17px;line-height:1.8}\n.grid{display:grid;gap:14px}\n.kpis{grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin:18px 0}\n.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px}\n.kpi .k{color:var(--muted);font-size:13px}\n.kpi .v{font-size:26px;font-weight:700;margin-top:2px}\nh2{font-size:19px;margin:30px 0 12px}\n.cap{color:var(--muted);font-size:14px;margin:0 0 12px}\n.two{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}\nsvg{width:100%;height:auto;direction:ltr}\nsvg .val{font-size:12px;fill:var(--ink);font-weight:600}\nsvg .lbl{font-size:12px;fill:var(--muted)}\nsvg .gr{font-size:11px;font-weight:600}\nsvg .up{fill:var(--up)}\nsvg .down{fill:var(--down)}\n.hrow{display:grid;grid-template-columns:110px 1fr auto;gap:10px;align-items:center;margin:10px 0;font-size:14px}\n.htrack{background:#EDF1F5;border-radius:6px;height:14px;overflow:hidden}\n.hfill{background:var(--accent);height:100%;border-radius:6px}\n.hval{white-space:nowrap;font-weight:600}\n.sub{color:var(--muted);font-weight:400;font-size:12px}\n.finding{border-inline-start:4px solid var(--accent)}\n.risk{border-inline-start:4px solid var(--hi)}\n.finding h3,.risk h3{margin:0 0 4px;font-size:16px}\n.finding p,.risk p,.rec p{margin:0;color:var(--muted);font-size:14.5px}\n.rec{display:grid;gap:6px}\n.rec h3{margin:0;font-size:16px}\n.badge{display:inline-block;font-size:12px;font-weight:700;padding:2px 10px;border-radius:999px;width:fit-content}\n.p-high{background:#FDE8E6;color:#8F1D16}\n.p-med{background:#FFF1D6;color:#7A4B00}\n.p-low{background:#E4F1E9;color:#17613A}\n.dq{background:#F8FAFC}\n.dq p{margin:0 0 6px;font-size:14.5px}\nfooter{margin-top:28px;color:var(--muted);font-size:12.5px;text-align:center}\n@media print{body{background:#fff}.wrap{padding:0}.card,header{break-inside:avoid}h2{break-after:avoid}.two>div{break-inside:avoid}}\n.two .hrow{grid-template-columns:80px 1fr}.two .hval{grid-column:2}\n@media print{h2{margin:20px 0 8px}footer{margin-top:14px}}\n</style>\n</head>\n<body><div class=\"wrap\">\n<header>\n  <h1>${esc(R.title)}</h1>\n  <div class=\"meta\">الفترة: ${esc(S.period.from)} إلى ${esc(S.period.to)} · تاريخ الإصدار: ${today}</div>\n  <div class=\"headline\">${esc(R.headline)}</div>\n</header>\n\n<section class=\"grid kpis\">\n${kpis.map(([k, v]) => `<div class=\"card kpi\"><div class=\"k\">${k}</div><div class=\"v\">${v}</div></div>`).join('\\n')}\n</section>\n\n<h2>الإيراد الشهري</h2>\n<div class=\"card\">\n  <p class=\"cap\">${esc(cap.monthly)} (النسبة أسفل كل شهر: التغير عن الشهر السابق، والشهر الأعلى مميّز بالبرتقالي)</p>\n  ${columnChart(S.by_month)}\n</div>\n\n<div class=\"grid two\">\n  <div><h2>الإيراد حسب المنطقة</h2><div class=\"card\"><p class=\"cap\">${esc(cap.region)}</p>${hBars(S.by_region, share)}</div></div>\n  <div><h2>الإيراد حسب الفئة</h2><div class=\"card\"><p class=\"cap\">${esc(cap.category)}</p>${hBars(S.by_category, (d) => `${share(d)} · ${margin(d)}`)}</div></div>\n</div>\n\n<h2>أعلى 5 منتجات بالإيراد</h2>\n<div class=\"card\">${hBars(topProducts, margin)}</div>\n\n<h2>أبرز النتائج</h2>\n<div class=\"grid\">\n${arr(R.key_findings).map((f) => `<div class=\"card finding\"><h3>${esc(f.title)}</h3><p>${esc(f.detail)}</p></div>`).join('\\n')}\n</div>\n\n<h2>المخاطر</h2>\n<div class=\"grid\">\n${arr(R.risks).map((r) => `<div class=\"card risk\"><h3>${esc(r.title)}</h3><p>${esc(r.detail)}</p></div>`).join('\\n')}\n</div>\n\n<h2>التوصيات</h2>\n<div class=\"grid\">\n${arr(R.recommendations).map((r) => { const p = prio[r.priority] ?? prio.medium; return `<div class=\"card rec\"><span class=\"badge ${p[1]}\">${p[0]}</span><h3>${esc(r.action)}</h3><p>${esc(r.rationale)}</p></div>`; }).join('\\n')}\n</div>\n\n<h2>جودة البيانات</h2>\n<div class=\"card dq\">\n  <p>بدأ التحليل بـ ${fmt(dq.raw_rows)} سجلًا؛ أُزيل ${fmt(dq.duplicates_removed)} سجلًا مكررًا، واستُبعد ${fmt(dq.excluded_rows)} سجلًا لمشاكل في الجودة، فاعتُمد ${fmt(dq.valid_rows)} سجلًا صالحًا.</p>\n  <p>${esc(R.data_quality_note)}</p>\n</div>\n\n<footer>أُنشئ هذا التقرير آليًا عبر n8n وClaude · الأرقام في البطاقات والرسوم محسوبة بالكود من البيانات المنظّفة، والنص التحليلي من إعداد النموذج</footer>\n</div></body></html>`;\n\n// 4) Return as a binary file for the next node\nconst fileName = `Sales_Executive_Report_${isoDay}.html`;\nconst binary = await this.helpers.prepareBinaryData(Buffer.from(html, 'utf8'), fileName, 'text/html');\nreturn [{ json: { fileName, title: R.title, headline: R.headline }, binary: { data: binary } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1696,
+        400
+      ],
+      "id": "50c2bcfb-f608-4f64-8d18-aaa960171fe9",
+      "name": "Build HTML"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Answer Report — turns the agent's markdown answer into a printable HTML report\nconst question = String($('When chat message received').first().json.chatInput ?? '');\nconst answer = String($input.first().json.output ?? $input.first().json.text ?? '');\nconst S = $('Summarize').first().json.summary;\n\nconst esc = (s) => String(s ?? '').replace(/[&<>\"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[c]));\nconst inline = (s) => esc(s).replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');\n\n// --- markdown -> HTML (headings, tables, lists, bold, paragraphs) ---\nconst lines = answer.replace(/\\r/g, '').split('\\n');\nconst isTable = (l) => l.trim().startsWith('|');\nconst isUl = (l) => /^\\s*[-*•]\\s+/.test(l);\nconst isOl = (l) => /^\\s*\\d+[.)]\\s+/.test(l);\nconst isHead = (l) => /^#{1,4}\\s+/.test(l.trim());\nconst isHr = (l) => /^(-{3,}|\\*{3,})$/.test(l.trim());\nconst isSpecial = (l) => isTable(l) || isUl(l) || isOl(l) || isHead(l) || isHr(l);\nconst cells = (r) => r.trim().replace(/^\\||\\|$/g, '').split('|').map((c) => c.trim());\nconst isSep = (r) => /^\\|?[\\s:|-]+\\|?$/.test(r.trim()) && r.includes('-');\n\nconst out = [];\nlet i = 0;\nwhile (i < lines.length) {\n  const t = lines[i].trim();\n  if (!t) { i++; continue; }\n  if (isHr(lines[i])) { out.push('<hr>'); i++; continue; }\n  if (isHead(lines[i])) {\n    const m = t.match(/^(#{1,4})\\s+(.*)$/);\n    out.push(`<h${m[1].length <= 2 ? 2 : 3}>${inline(m[2])}</h${m[1].length <= 2 ? 2 : 3}>`);\n    i++; continue;\n  }\n  if (isTable(lines[i])) {\n    const rows = [];\n    while (i < lines.length && isTable(lines[i])) { rows.push(lines[i]); i++; }\n    const body = rows.filter((r) => !isSep(r)).map(cells);\n    const [head, ...rest] = body;\n    out.push(`<div class=\"tw\"><table><thead><tr>${head.map((c) => `<th>${inline(c)}</th>`).join('')}</tr></thead><tbody>${rest.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);\n    continue;\n  }\n  if (isUl(lines[i]) || isOl(lines[i])) {\n    const ordered = isOl(lines[i]);\n    const items = [];\n    while (i < lines.length && (ordered ? isOl(lines[i]) : isUl(lines[i]))) {\n      items.push(lines[i].replace(/^\\s*([-*•]|\\d+[.)])\\s+/, ''));\n      i++;\n    }\n    const tag = ordered ? 'ol' : 'ul';\n    out.push(`<${tag}>${items.map((x) => `<li>${inline(x)}</li>`).join('')}</${tag}>`);\n    continue;\n  }\n  const para = [];\n  while (i < lines.length && lines[i].trim() && !isSpecial(lines[i])) { para.push(lines[i].trim()); i++; }\n  out.push(`<p>${inline(para.join(' '))}</p>`);\n}\n\n// --- timestamp (Riyadh) ---\nconst p = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Riyadh', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })\n  .formatToParts(new Date()).reduce((a, x) => { a[x.type] = x.value; return a; }, {});\nconst stamp = `${p.year}-${p.month}-${p.day}_${p.hour}${p.minute}`;\nconst issued = `${p.day}/${p.month}/${p.year} ${p.hour}:${p.minute}`;\n\nconst html = `<!doctype html>\n<html lang=\"ar\" dir=\"rtl\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>تقرير إجابة: ${esc(question).slice(0, 80)}</title>\n<style>\n:root{--bg:#F4F6F9;--card:#fff;--ink:#1B2733;--muted:#5B6B7A;--line:#E3E8EE;--accent:#1F5F99}\n*{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact}\nbody{margin:0;background:var(--bg);color:var(--ink);font-family:'Segoe UI',Tahoma,Arial,sans-serif;line-height:1.8}\n.wrap{max-width:900px;margin:0 auto;padding:28px 18px 48px}\nheader{background:linear-gradient(135deg,#0F2E4A,#1F5F99);color:#fff;border-radius:16px;padding:24px 28px}\nheader .tag{font-size:13px;opacity:.8}\nheader h1{margin:4px 0 8px;font-size:22px;line-height:1.5}\nheader .meta{opacity:.85;font-size:13px}\n.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px 26px;margin-top:16px}\nh2{font-size:19px;margin:22px 0 8px;color:#0F2E4A}\nh2:first-child,h3:first-child{margin-top:0}\nh3{font-size:16.5px;margin:18px 0 6px}\np{margin:8px 0}\nul,ol{margin:8px 0;padding-inline-start:24px}\nli{margin:5px 0}\nhr{border:0;border-top:1px solid var(--line);margin:18px 0}\ncode{background:#EDF1F5;border-radius:4px;padding:1px 6px;font-size:.9em;direction:ltr;unicode-bidi:embed}\n.tw{overflow-x:auto;margin:12px 0}\ntable{border-collapse:collapse;width:100%;font-size:14.5px}\nth,td{border:1px solid var(--line);padding:8px 12px;text-align:start}\nth{background:#EAF1F8;font-weight:700}\ntbody tr:nth-child(even){background:#F8FAFC}\nfooter{margin-top:22px;color:var(--muted);font-size:12.5px;text-align:center}\n@media print{body{background:#fff}.wrap{padding:0}header,.card{break-inside:auto}h2,h3{break-after:avoid}tr,li{break-inside:avoid}}\n</style>\n</head>\n<body><div class=\"wrap\">\n<header>\n  <div class=\"tag\">تقرير إجابة</div>\n  <h1>${esc(question)}</h1>\n  <div class=\"meta\">بيانات الفترة: ${esc(S.period.from)} إلى ${esc(S.period.to)} · تاريخ الإصدار: ${issued}</div>\n</header>\n<div class=\"card\">\n${out.join('\\n')}\n</div>\n<footer>أُنشئ هذا التقرير آليًا عبر n8n وClaude · الأرقام مأخوذة من ملخص محسوب بالكود من البيانات المنظّفة</footer>\n</div></body></html>`;\n\nconst fileName = `Answer_${stamp}.html`;\nconst binary = await this.helpers.prepareBinaryData(Buffer.from(html, 'utf8'), fileName, 'text/html');\nconst reply = `${answer}\\n\\n---\\n📄 حُفظ تقرير هذه الإجابة في C:\\\\n8n-files\\\\${fileName}`;\nreturn [{ json: { fileName, output: reply }, binary: { data: binary } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1712,
+        0
+      ],
+      "id": "10e9b80e-70ab-4c74-be31-0b6dbe84e11e",
+      "name": "Answer Report"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/home/node/.n8n-files/{{ $json.fileName }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        1936,
+        0
+      ],
+      "id": "87674f00-581f-4394-bb62-91f1f2c5719c",
+      "name": "Save Answer"
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { output: $('Answer Report').first().json.output } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        0
+      ],
+      "id": "a97091ef-7fb2-4bd8-b309-018e63fd5a2b",
+      "name": "Answer Reply"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/home/node/.n8n-files/{{ $json.fileName }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        1920,
+        400
+      ],
+      "id": "8157a578-a887-4a0e-af90-db4f4b0a5a1a",
+      "name": "Save Report"
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $('Build HTML').first().json;\nconst output = `✅ تم إنشاء التقرير التنفيذي وحفظه في مجلد C:\\\\n8n-files\n\n📄 الملف: ${r.fileName}\n\n${r.headline}\n\nافتح الملف بالنقر المزدوج ليظهر في المتصفح، ويمكنك طباعته PDF من (Ctrl + P).`;\nreturn [{ json: { output } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2144,
+        400
+      ],
+      "id": "b3cac9f2-e61f-4db5-8776-3af9f0b9ab39",
+      "name": "Report Reply"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Read/Write Files from Disk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read/Write Files from Disk": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Clean Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Data": {
+      "main": [
+        [
+          {
+            "node": "Summarize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize": {
+      "main": [
+        [
+          {
+            "node": "Q&A or Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q&A or Report": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Report": {
+      "main": [
+        [
+          {
+            "node": "Build HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build HTML": {
+      "main": [
+        [
+          {
+            "node": "Save Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Answer Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer Report": {
+      "main": [
+        [
+          {
+            "node": "Save Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Answer": {
+      "main": [
+        [
+          {
+            "node": "Answer Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Report": {
+      "main": [
+        [
+          {
+            "node": "Report Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": true
+  },
+  "versionId": "bce3fe5d-b256-4b55-a4e1-d42e922839b3",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e0ebeb18831f7652405435931ea24a692a135e374584fc010a2f273c55b24e65"
+  },
+  "nodeGroups": [],
+  "id": "ZNMaD52lhRu1UdEq",
+  "tags": []
+}
