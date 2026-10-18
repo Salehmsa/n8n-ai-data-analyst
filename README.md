@@ -8,11 +8,19 @@ A conversational data analyst and automated executive-report generator built wit
 
 ## Demo
 
-| Workflow | Chat answer | Executive report |
-|---|---|---|
-| ![Workflow](docs/images/01-workflow.png) | ![Chat](docs/images/02-chat-answer.png) | ![Report](docs/images/03-executive-report.png) |
+**1. The workflow in n8n**
 
-Sample outputs you can open in a browser: [`sample-outputs/`](sample-outputs/)
+![Workflow](docs/images/01-workflow.png)
+
+**2. A question answered in the chat (a per-question HTML report is saved automatically)**
+
+![Chat answer](docs/images/02-chat-answer.png)
+
+**3. The executive report (open it in a browser, print with Ctrl+P)**
+
+![Executive report](docs/images/03-executive-report.png)
+
+Sample outputs (download a file and open it in a browser): [`sample-outputs/`](sample-outputs/)
 
 ---
 
