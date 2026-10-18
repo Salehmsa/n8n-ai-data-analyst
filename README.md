@@ -81,13 +81,12 @@ Headline results from the sample run: revenue **14,670,851**, profit **4,701,152
 **Requirements:** Docker Desktop, an Anthropic API key (console.anthropic.com — separate from a Claude subscription).
 
 1. Create a folder for data and reports, e.g. `C:\n8n-files`, and copy `data/Sales_Data.csv` into it.
-2. Run n8n (example for Windows; adjust the path):
-   ```bash
-   docker run -d --name n8n -p 5678:5678 \
-     -v n8n_data:/home/node/.n8n \
-     -v C:\n8n-files:/home/node/.n8n-files \
-     docker.n8n.io/n8nio/n8n
+2. Run n8n (PowerShell on Windows, one line; adjust the folder path if yours differs):
+
+   ```powershell
+   docker run -d --name n8n -p 5678:5678 -v n8n_data:/home/node/.n8n -v C:\n8n-files:/home/node/.n8n-files docker.n8n.io/n8nio/n8n
    ```
+
    n8n restricts file access to `/home/node/.n8n-files`, which is why the folder is mounted there.
 3. Open `http://localhost:5678`, then **Workflows → Import from file** and choose `workflow/ai-data-analyst.json`.
 4. Create an **Anthropic** credential with your API key and select it in the two Anthropic nodes (the AI Agent's Chat Model and Write Report). Model used: `claude-sonnet-5-5`.
